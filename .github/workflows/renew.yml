@@ -54,7 +54,9 @@ jobs:
           rm -f sing-box sing-box-config.json sing-box.log
 
       # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      # always(): 续期失败时也要提交，否则工作流一变红保活就断了
       - name: 🕒 提交运行时间
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

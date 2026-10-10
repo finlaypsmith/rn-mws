@@ -5,6 +5,7 @@ import os
 import re
 import json
 import time
+import sys
 import subprocess
 import base64
 import urllib.parse
@@ -38,10 +39,20 @@ DISCORD_UA = (
 )
 
 # ==========================================
+def normalize_proxy_url(value: str) -> str:
+    """socks5:// 是「本地解析域名」：curl_cffi 解析时优先选 AAAA(IPv6)，
+    而代理节点普遍只有 IPv4 出口，IPv6 地址送进隧道会被立刻断开，
+    表现为 curl: (35) BoringSSL SSL_connect: Connection closed abruptly。
+    统一改写成 socks5h://，让代理端解析域名，顺带绕开本地 DNS 污染。"""
+    if value.lower().startswith("socks5://"):
+        return "socks5h://" + value[len("socks5://"):]
+    return value
+
 def build_proxies():
     """按配置返回 curl_cffi 需要的代理字典，未启用则返回 None"""
     if IS_PROXY:
-        return {"http": PROXY_SERVER, "https": PROXY_SERVER}
+        server = normalize_proxy_url(PROXY_SERVER)
+        return {"http": server, "https": server}
     return None
 
 def send_tg_notification(message: str):
@@ -327,7 +338,8 @@ def fetch_new_cookie_via_http() -> str:
         return ""
 
 # ================= 主流程 =================
-def main():
+def main() -> int:
+    """返回退出码：0 = 全部续期成功，1 = 有失败或配置缺失（让 Actions 变红）"""
     global COOKIE
 
     print("#" * 25)
@@ -337,14 +349,14 @@ def main():
     server_list = [s_id.strip() for s_id in SERVER_IDS.split(",") if s_id.strip()]
     if not server_list:
         print("❌ 未配置有效的 SERVER_IDS")
-        return
+        return 1
 
     if not COOKIE and not DISCORD_TOKEN:
         print("❌ COOKIE 和 DISCORD_TOKEN 均为空，请添加相关变量后再运行！")
-        return
+        return 1
 
     print(f"🚀 开始续期任务，共 {len(server_list)} 个服务器: {server_list}")
-    print(f"🔗 使用代理: {PROXY_SERVER}" if IS_PROXY else "🍭 未使用代理，直连访问")
+    print(f"🔗 使用代理: {normalize_proxy_url(PROXY_SERVER)}" if IS_PROXY else "🍭 未使用代理，直连访问")
 
     if COOKIE:
         expiry = get_expiry_from_cookie(COOKIE)
@@ -378,7 +390,7 @@ def main():
                 f"❌ 续期失败\n👤 账户: {EMAIL}\n"
                 "⚠️ COOKIE 可能已失效，且未配置 DISCORD_TOKEN，无法自动刷新。"
             )
-            return
+            return 1
 
         # 纯 HTTP OAuth（curl_cffi chrome TLS 指纹，无需浏览器）
         new_cookie = fetch_new_cookie_via_http()
@@ -388,7 +400,7 @@ def main():
                 f"❌ 续期失败\n👤 账户: {EMAIL}\n"
                 "⚠️ COOKIE 失效且 Discord OAuth 登录失败，请检查 DISCORD_TOKEN 或代理节点。"
             )
-            return
+            return 1
 
         COOKIE = new_cookie
 
@@ -428,13 +440,16 @@ def main():
             # print(f"📋 如需手动更新，请将 COOKIE 设置为: {new_cookie}")
 
     print("🏁 脚本执行完毕")
+    # 退出码反映续期结果：失败时让 Actions 变红（TG 通知之外的第二道提醒）
+    return 0 if all_ok else 1
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except Exception as e:
         import traceback
         traceback.print_exc()
         send_tg_notification(
             f"🇯🇵 MWS 续期通知\n\n❌ 脚本异常退出\n👤 账户: {EMAIL}\n⚠️ {e}"
         )
+        sys.exit(1)
