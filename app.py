@@ -411,11 +411,28 @@ def open_site(sb, url: str) -> bool:
         sb.sleep(3)
     return False
 
-COOKIE_SET_JS = (
-    "var token = arguments[0];"
-    f"document.cookie = '{COOKIE_NAME}=' + token + '; path=/; Secure';"
-    f"return document.cookie.indexOf('{COOKIE_NAME}=') !== -1;"
-)
+def inject_cookie(sb, token: str) -> bool:
+    """用 WebDriver cookie API 注入 __Host- 登录 cookie。
+    CI 过盾后页面可能短暂停留在挑战过渡文档，document.cookie 会抛
+    Access denied；改走 WebDriver API，等 URL 回到站点域再注入，失败重试。"""
+    deadline = time.time() + 60
+    last_err = ""
+    while time.time() < deadline:
+        try:
+            if sb.get_current_url().startswith(SITE_ORIGIN):
+                sb.driver.add_cookie({
+                    "name": COOKIE_NAME,
+                    "value": token,
+                    "path": "/",
+                    "secure": True,
+                    "sameSite": "Lax",
+                })
+                return True
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+        sb.sleep(3)
+    print(f"❌ COOKIE 注入失败: {last_err or '60秒内 URL 未回到站点域'}")
+    return False
 
 ME_FETCH_JS = """
 var callback = arguments[arguments.length - 1];
@@ -471,8 +488,10 @@ def renew_via_browser(token: str, server_list: list) -> dict:
 
     sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "ja-JP"}
     if IS_PROXY:
-        print(f"🔗 浏览器挂载代理: {normalize_proxy_url(PROXY_SERVER)}")
-        sb_kwargs["proxy"] = normalize_proxy_url(PROXY_SERVER)
+        # Chromium 只认 socks5:// scheme（其 SOCKS5 默认由代理端解析 DNS，语义等同 socks5h）
+        browser_proxy = normalize_proxy_url(PROXY_SERVER).replace("socks5h://", "socks5://")
+        print(f"🔗 浏览器挂载代理: {browser_proxy}")
+        sb_kwargs["proxy"] = browser_proxy
 
     try:
         from seleniumbase import SB
@@ -488,8 +507,7 @@ def renew_via_browser(token: str, server_list: list) -> dict:
                 return results
 
             # 2) 注入登录 cookie 后重新进入站点（全新浏览器会话无同名 HttpOnly cookie，可安全注入）
-            if not sb.execute_script(COOKIE_SET_JS, token):
-                print("❌ COOKIE 注入失败")
+            if not inject_cookie(sb, token):
                 return results
             if not open_site(sb, SITE_ORIGIN):
                 print("❌ 注入 COOKIE 后再次过盾失败")
