@@ -141,17 +141,6 @@ def update_github_secret(secret_name: str, new_value: str) -> bool:
         print(f"❌ 更新 Secret {secret_name} 异常: {e}")
         return False
 
-def login_headers():
-    """带 COOKIE 的 API 请求头"""
-    return {
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
-        "Content-Type": "application/json",
-        "Cookie": f"{COOKIE_NAME}={COOKIE}",
-        "Origin": SITE_ORIGIN,
-        "Referer": f"{SITE_ORIGIN}/",
-    }
-
 def get_expiry_from_cookie(value: str):
     """从 JWT 里解析过期时间（JST 展示），解析失败返回 None"""
     try:
@@ -168,36 +157,7 @@ def get_expiry_from_cookie(value: str):
     except Exception:
         return None
 
-def renew_server(server_id: str):
-    """调用续期 API，返回 (是否成功, HTTP 状态码, 剩余小时数)"""
-    url = f"{SITE_ORIGIN}/api/bots/{server_id}/renew"
-
-    try:
-        response = requests.post(
-            url,
-            headers=login_headers(),
-            timeout=15,
-            impersonate="chrome136",
-            proxies=build_proxies(),
-        )
-
-        if response.status_code == 200:
-            try:
-                remaining_hours = response.json().get("timer", {}).get("remaining_hours", "未知")
-            except json.JSONDecodeError:
-                remaining_hours = "未知"
-
-            print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining_hours} 小时")
-            return True, response.status_code, remaining_hours
-
-        print(f"❌ 服务器 [{server_id}] 续期失败，状态码: {response.status_code}, 响应: {response.text[:300]}")
-        return False, response.status_code, None
-
-    except Exception as e:
-        print(f"❌ 服务器 [{server_id}] 请求发生异常, 请检查服务器是否被删除: {e}")
-        return False, None, None
-
-# ================= Discord OAuth 登录（API 请求失败时的兜底，纯 HTTP） =================
+# ================= Discord OAuth 登录（COOKIE 失效时自动刷新，纯 HTTP） =================
 #   1) GET /auth/login 拿授权 URL（含 state），Session 自动种下 oauth_state cookie
 #   2) DISCORD_TOKEN 调 Discord OAuth2 API 授权，拿回带 code 的回调 location
 #   3) GET 回调 -> 302 到 /auth/success?code=<一次性code>
@@ -619,54 +579,43 @@ def main() -> int:
     else:
         print("ℹ️ 未配置 COOKIE，将直接走 Discord 登录流程")
 
-    # ---------- 第一轮：使用现有 COOKIE 调续期 API ----------
-    results = {}      
-    all_ok = True
-    for s_id in server_list:
-        ok, status_code, remaining = renew_server(s_id)
-        results[s_id] = remaining if ok else None
-        if not ok:
-            all_ok = False
-            if status_code in (401, 403):
-                print(f"⚠️ [{s_id}] 认证失败（HTTP {status_code}），COOKIE 可能已失效")
-        time.sleep(2)
-
-    new_cookie = ""
-
-    if all_ok:
-        print("🏁 全部服务器续期成功，续期任务完成")
-    else:
-        # ---------- 第二轮：真实浏览器(UC 过 Cloudflare 盾)内续期 ----------
-        # 旧 COOKIE 可能仍然有效、只是被盾拦，先不急着刷新
-        print("\n🛡️ 纯 HTTP 续期未全部成功(站点已加 CF 盾)，切换真实浏览器重试...")
-        token = COOKIE
-        browser_results = renew_via_browser(token, server_list)
+    # ---------- 真实浏览器(UC 过 Cloudflare 盾)内续期 ----------
+    # 续期 API 无条件要求 turnstile_token（403 captcha_required），纯 HTTP 必然失败，
+    # 直接走浏览器；COOKIE 未配置时浏览器内 /api/auth/me 会 401，走 OAuth 刷新。
+    results = {}
+    all_ok = False
+    if COOKIE:
+        browser_results = renew_via_browser(COOKIE, server_list)
         for s_id, (ok, _, remaining) in browser_results.items():
             results[s_id] = remaining if ok else None
+    else:
+        browser_results = {s_id: (False, 401, None) for s_id in server_list}
 
-        # 浏览器内仍认证失败(401/403)时，走 Discord OAuth 刷新 COOKIE 再试一次
-        auth_failed = any(st in (401, 403) for _, st, _ in browser_results.values())
-        if auth_failed and not all(v[0] for v in browser_results.values()):
-            if not DISCORD_TOKEN:
-                print("❌ 浏览器内认证失败，且未配置 DISCORD_TOKEN，无法自动刷新 COOKIE")
+    # 浏览器内认证失败(401/403)时，走 Discord OAuth 刷新 COOKIE 再试一次
+    token = COOKIE
+    auth_failed = any(st in (401, 403) for _, st, _ in browser_results.values())
+    if auth_failed and not all(v[0] for v in browser_results.values()):
+        if not DISCORD_TOKEN:
+            print("❌ 浏览器内认证失败，且未配置 DISCORD_TOKEN，无法自动刷新 COOKIE")
+        else:
+            refreshed = fetch_new_cookie_with_retry()
+            if refreshed:
+                token = refreshed
+                print("\n🔁 使用新 COOKIE 在浏览器内重新续期 ...")
+                browser_results = renew_via_browser(token, server_list)
+                for s_id, (ok, _, remaining) in browser_results.items():
+                    results[s_id] = remaining if ok else None
             else:
-                refreshed = fetch_new_cookie_with_retry()
-                if refreshed:
-                    token = refreshed
-                    print("\n🔁 使用新 COOKIE 在浏览器内重新续期 ...")
-                    browser_results = renew_via_browser(token, server_list)
-                    for s_id, (ok, _, remaining) in browser_results.items():
-                        results[s_id] = remaining if ok else None
-                else:
-                    print("❌ Discord OAuth 刷新 COOKIE 失败")
+                print("❌ Discord OAuth 刷新 COOKIE 失败")
 
-        if token != COOKIE:
-            COOKIE = token
-            new_cookie = token
+    new_cookie = ""
+    if token != COOKIE:
+        COOKIE = token
+        new_cookie = token
 
-        all_ok = all(v is not None for v in results.values())
-        if all_ok:
-            print("🏁 浏览器续期全部成功，续期任务完成")
+    all_ok = all(v is not None for v in results.values()) if results else False
+    if all_ok:
+        print("🏁 全部服务器续期成功，续期任务完成")
 
     # ---------- 最后统一发送一次 TG 通知 ----------
     local_time = time.gmtime(time.time() + 8 * 3600)
