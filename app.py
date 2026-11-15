@@ -535,7 +535,8 @@ def renew_via_browser(token: str, server_list: list) -> dict:
                         print(f"❌ Turnstile 渲染失败: {render}")
                         continue
                     sb_token = ""
-                    deadline = time.time() + 60
+                    deadline = time.time() + 120
+                    last_click = 0.0
                     while time.time() < deadline:
                         sb_token = sb.execute_script("return window.__sbToken || ''") or ""
                         if sb_token:
@@ -544,6 +545,13 @@ def renew_via_browser(token: str, server_list: list) -> dict:
                         if err:
                             print(f"❌ Turnstile 错误: {err}")
                             break
+                        # CI/xvfb 下 Turnstile 常升级为交互挑战，需模拟点击复选框
+                        if time.time() - last_click > 8:
+                            try:
+                                sb.uc_gui_click_captcha()
+                                last_click = time.time()
+                            except Exception:
+                                pass
                         sb.sleep(2)
                     if not sb_token:
                         print("❌ 60秒内未拿到 Turnstile token")
